@@ -54,11 +54,11 @@ jobs:
         
     - name: 提交更新
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_tok: ${{ secrets.GITHUB_tok }}
       run: |
         git config --global user.email "action@github.com"
         git config --global user.name "GitHub Action"
-        git remote set-url origin https://x-access-token:$GITHUB_TOKEN@github.com/${{ github.repository }}.git
+        git remote set-url origin https://x-access-token:$GITHUB_tok@github.com/${{ github.repository }}.git
         git add proxy.txt
         git commit -m "更新代理列表" || echo "没有更改"
         git push origin +main:main
