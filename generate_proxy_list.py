@@ -1,97 +1,159 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""原版抓取脚本的最小改动版：只把「能使用的」纯代理地址写入 proxy.txt。
+
+相对原版的改动：
+1. 不再写入「入库时间」，也不再拼接 [机房] / [家宽] / [原生IP] 等地区描述；
+   proxy.txt 每行只有一个 协议://IP:端口；
+2. 过滤脱敏 IP（含 X / *）、非法端口、私有/保留地址、非白名单协议，并去重；
+3. 可选 --check 做 TCP / SOCKS5 存活探测，只写探测成功的节点；
+4. 原子写入；抓取失败或零结果时保留原有 proxy.txt，不清空列表。
+
+用法：
+    python generate_proxy_list_legacy.py
+    python generate_proxy_list_legacy.py --check
+    python generate_proxy_list_legacy.py --url=https://proxy-socks5.com/
+"""
+
+import ipaddress
+import os
+import re
+import socket
+import sys
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-import time
-from datetime import datetime
+
+URL = "https://tomcat1235.nyc.mn/proxy_list"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+PROTOCOLS = {"socks5", "socks4", "http", "https"}
+MASK_RE = re.compile(r"(?i)(?<![a-z0-9])[x*?]{1,3}(?![a-z0-9])|…|\.{3}|隐藏|脱敏")
+NOISE_RE = re.compile(r"(?i)已?复制|copied!?|点击复制|copy")
+FULL_URL_RE = re.compile(r"^(socks5|socks4|https?)://([^:/\s]+):(\d+)$", re.I)
+
+
+def is_usable(protocol: str, ip: str, port: str) -> bool:
+    """判断一条记录是否是「能使用的」节点。"""
+    if protocol not in PROTOCOLS or not port.isdigit():
+        return False
+    if not 1 <= int(port) <= 65535:
+        return False
+    if MASK_RE.search(ip):          # 178.207.X.214 这类脱敏地址不可用
+        return False
+    try:
+        addr = ipaddress.ip_address(ip.strip("[]"))
+    except ValueError:
+        return False
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+        return False
+    return True
+
+
+def probe(proxy: str, timeout: float = 2.0) -> bool:
+    """TCP 连通性；SOCKS5 额外做无认证握手。"""
+    m = re.match(r"^(\w+)://([^:]+):(\d+)$", proxy)
+    if not m:
+        return False
+    scheme, host, port = m.group(1), m.group(2), int(m.group(3))
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            if scheme.startswith("socks"):
+                sock.sendall(b"\x05\x01\x00")
+                reply = sock.recv(2)
+                return len(reply) >= 2 and reply[0] == 0x05
+            return True
+    except (OSError, socket.timeout, ValueError):
+        return False
+
 
 class ProxyListScraper:
-    def __init__(self):
-        self.url = "https://tomcat1235.nyc.mn/proxy_list"
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-    
+    def __init__(self, url: str = URL):
+        self.url = url
+
     def scrape_proxy_list(self):
-        """抓取代理列表"""
+        """抓取代理列表，返回纯地址字符串列表。"""
         try:
             print(f"正在抓取代理列表: {self.url}")
-            response = requests.get(self.url, headers=self.headers, timeout=30)
+            response = requests.get(self.url, headers=HEADERS, timeout=(5, 20))
             response.raise_for_status()
-            response.encoding = 'utf-8'
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # 查找包含代理数据的表格
-            table = soup.find('table')
-            if not table:
-                print("未找到代理数据表格")
-                return []
-            
-            proxies = []
-            rows = table.find_all('tr')[1:]  # 跳过表头
-            
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) >= 4:  # 需要至少4列：协议、IP、端口、位置
-                    protocol = cells[0].text.strip()
-                    ip = cells[1].text.strip()
-                    port = cells[2].text.strip()
-                    location = cells[3].text.strip() if len(cells) > 3 else "未知"
-                    
-                    # 清理位置信息中的多余文本
-                    location = location.replace('复制', '').replace('已复制', '').replace('已', '').strip()
-                    # 移除多余的空行、换行符和多余的空格
-                    location = ' '.join(location.split())
-                    
-                    if protocol and ip and port:
-                        # 使用标准代理格式：协议://ip:port [地址位置]
-                        proxy = f"{protocol}://{ip}:{port} [{location}]"
-                        proxies.append(proxy)
-            
-            print(f"成功抓取到 {len(proxies)} 个代理")
+            response.encoding = "utf-8"
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            proxies, seen = [], set()
+
+            # 页面可能有多张表，逐张扫描，避免取到国家统计表
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) < 3:
+                        continue
+
+                    protocol = cells[0].get_text(strip=True).lower()
+                    ip = NOISE_RE.sub("", cells[1].get_text(" ", strip=True)).strip()
+                    port = cells[2].get_text(strip=True)
+
+                    # 兼容整串 URL 写在单个单元格里的表格
+                    m = FULL_URL_RE.match(ip)
+                    if m:
+                        protocol, ip, port = m.group(1).lower(), m.group(2), m.group(3)
+
+                    if not is_usable(protocol, ip, port):
+                        continue
+                    proxy = f"{protocol}://{ip}:{port}"   # 不带任何描述
+                    if proxy in seen:
+                        continue
+                    seen.add(proxy)
+                    proxies.append(proxy)
+
+            print(f"成功抓取到 {len(proxies)} 个可用代理")
             return proxies
-            
+
         except requests.RequestException as e:
             print(f"网络请求错误: {e}")
             return []
         except Exception as e:
             print(f"抓取错误: {e}")
             return []
-    
-    def save_to_file(self, proxies, filename='proxy.txt'):
-        """保存代理列表到文件"""
+
+    def save_to_file(self, proxies, filename="proxy.txt"):
+        """只写纯地址，一行一个；无入库时间、无描述、无注释头。"""
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                # 写入时间戳
-                f.write(f"# 代理列表更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# 总计: {len(proxies)} 个代理\n\n")
-                
-                # 写入代理列表 (标准格式：协议://ip:port [地址位置])
-                for proxy in proxies:
-                    f.write(f"{proxy}\n")
-            
-            print(f"代理列表已保存到 {filename}")
+            path = Path(filename)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text("\n".join(proxies) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            print(f"已写入 {len(proxies)} 个可用节点到 {filename}")
             return True
-            
         except Exception as e:
             print(f"保存文件错误: {e}")
             return False
 
+
 def main():
-    """主函数"""
-    scraper = ProxyListScraper()
-    
-    # 抓取代理列表
+    check = "--check" in sys.argv
+    url = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--url=")), URL)
+    scraper = ProxyListScraper(url)
     proxies = scraper.scrape_proxy_list()
-    
+
+    if check and proxies:
+        alive = [p for p in proxies if probe(p)]
+        print(f"存活探测: {len(alive)}/{len(proxies)} 个可用")
+        proxies = alive
+
     if proxies:
-        # 保存到文件
+        # 空结果时不写文件，保留上一次成功的列表
         scraper.save_to_file(proxies)
         print("代理列表抓取完成！")
     else:
-        print("未能获取到代理数据")
+        print("未能获取到可用代理，保留原有 proxy.txt")
+
 
 if __name__ == "__main__":
     main()
